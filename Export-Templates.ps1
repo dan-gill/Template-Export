@@ -8,9 +8,9 @@
 # Configure the variables below
 #######################
 # Specify a directory to download and install the new PowerCLI module to for future offline access
-$PSModulePath = $Env:SystemDrive + '\PowerCLIModule\'
-# Config import
-Get-Content -Path '.\settings.txt' |
+$PSModulePath = "$Env:SystemDrive\PowerCLIModule\"
+# Import settings from settings.txt file
+Get-Content -Path "$PSScriptRoot\settings.txt" |
 ForEach-Object -Begin {
     # Create Hashtable
     $Settings = @{}
@@ -22,34 +22,43 @@ ForEach-Object -Begin {
         $Settings.Add(($k[0] -replace '\s+', ''), ($k[1] -replace '\s+', ''))
     }
 }
+$MaxRunspaces = 20
 # Ohio vCenters
 $vCentersOH = 'OHOS-VDI-VCS107.opsus.local', 'OHOS-VC01.opsus.local'
 # Texas vCenters
 $vCentersTX = 'TXOS-VDI-VCS104.opsus.local', 'TXOS-VC01.opsus.local'
+# Synchronized hashtable
+$Configuration = [hashtable]::Synchronized(@{})
+$Configuration.ScriptErrors = @()
+# Delete path if it already exists
+$SavePath = "$Env:SystemDrive\CWave\Export-Templates"
+if (Test-Path -Path $SavePath) { Remove-Item -Path "$SavePath" -Recurse -Force }
+$null = New-Item -Path "$SavePath" -ItemType Directory -Force
+$ScriptErrors = "$SavePath\$(Get-Date -f yyyy-MM-dd)_ScriptErrors.log"
 # DataDomain password
-$password = ConvertTo-SecureString $Settings.Get_Item('passwd') -AsPlainText -Force
-$Cred = New-Object System.Management.Automation.PSCredential ($Settings.Get_Item('username'), $password)
+$password = ConvertTo-SecureString $Settings.passwd -AsPlainText -Force
+$Cred = New-Object System.Management.Automation.PSCredential ($Settings.username, $password)
 # DataDomains
 $DataDomainOH = '\\ohos-dd6300-1\z_EUC_From_OH'
 $DataDomainTX = '\\txos-dd6300-1\z_EUC_From_TX'
 # Match any case of {3 to 4 character mneumonic}-view, {3 to 4 character mneumonic}-view-{1 character},
 # {3 to 4 character mneumonic}-ctx-appmx, or {3 to 4 character mneumonic}-ctx-appmx-{1 character}
 # Mneumonic must only contain letters from the English alphabet
-$regexPattern = '^[a-zA-Z]{3,4}-(?:[Vv][Ii][Ee][Ww]|[Cc][Tt][Xx]-[Aa][Pp][Pp][Mm][Xx])(?:-.){0,1}$'
+$regexPattern = '^[a-zA-Z]{3,4}-(?:[Vv][Ii][Ee][Ww]|[Cc][Tt][Xx]-[Aa][Pp][Pp][Mm][Xx]).*$'
 
 # Number of backups to retain
 $retain = 26
 
 # The script needs to run on an OH or TX Engineer Desktop
-if ($env:computername -match '^[Tt][Xx][Oo][Ss]-[Ee][Nn][Gg]\d{2}$') {
+if ($env:computername -match "^[Tt][Xx][Oo][Ss]-[Ee][Nn][Gg]\d{2}$") {
     # Local computer is in TX, only list TX vCenters
     $vCenters = $vCentersTX
-} elseif ($env:computername -match '^(?:[Oo][Hh][Oo][Ss]|[Oo][Pp][Ss][Uu][Ss])-[Ee][Nn][Gg]-\d{2}$') {
+} elseif ($env:computername -match "^(?:[Oo][Hh][Oo][Ss]|[Oo][Pp][Ss][Uu][Ss])-[Ee][Nn][Gg]-\d{2}$") {
     # Local computer is in OH, only list OH vCenters
     $vCenters = $vCentersOH
 } else {
     Write-Error -Message "You must run this script from a VDI in OH or TX.`r`nExamples: OPSUS-ENG-12, OHOS-ENG-35, or TXOS-ENG97" -Category PermissionDenied
-    Exit 99              # Exiting script
+    Exit 10              # Exiting script
 }
 #####################################################################
 # Nothing to change below this line, commented throughout to explain
@@ -177,7 +186,7 @@ Try {
 }
 
 # Warn if the Certificate is invalid, but continue
-Set-PowerCLIConfiguration -InvalidCertificateAction Warn -Scope Session -Confirm:$false
+$null = Set-PowerCLIConfiguration -InvalidCertificateAction Warn -Scope Session -Confirm:$false
 
 # Needed for dialog boxes
 Add-Type -AssemblyName System.Windows.Forms
@@ -254,30 +263,55 @@ function myDialogBox {
 # Prompt user for vCenter to connect to
 $vCenter = myDialogBox -Title 'Select a vCenter:' -Prompt 'Please select a vCenter:' -Values $vCenters
 
-# Connect to vCenter selected
-Connect-VIServer $vCenter
+# Connect to vCenter selected using logged on user credentials
+$VIServer = $null
+while (!$VIServer) { $VIServer = Connect-VIServer $vCenter }
+$Configuration.VIServer = $VIServer
 
 # Retrieve list of powered off VMs formatted according to $regexPattern variable
-$TotalVMs = Get-VM | Where-Object { $_.PowerState -eq 'PoweredOff' -and $_.Name -match $regexPattern } | Sort-Object
+$VMs = Get-VM -Server $VIServer | Where-Object { $_.PowerState -eq 'PoweredOff' -and $_.Name -match $regexPattern } | Sort-Object
 
 # Prompt user to select the VM for export
-$vm = myDialogBox -Title 'Select a Template:' -Prompt 'Please select the Template:' -Values $TotalVMs.Name
+# $vm = myDialogBox -Title 'Select a Template:' -Prompt 'Please select the Template:' -Values $TotalVMs.Name
 
-# Make sure VM does not have any ISOs attached to it
-Get-VM -Name $vm | Get-CDDrive | Set-CDDrive -NoMedia -Confirm:$false
+$Worker = {
+    param($VM, $DD, $Configuration)
+    # Make sure VM does not have any ISOs attached to it
+    $null = Get-VM -Server $Configuration.VIServer -Name $VM | Get-CDDrive | Set-CDDrive -NoMedia -Confirm:$false
 
-# Hardcoded to No because removing snapshots will break the production image.
-# $removeSnapshot = myDialogBox -Title "Remove snapshot:" -Prompt "Do you want to remove snapshots from the VM?" -Values Yes, No
-$removeSnapshot = 'No'
+    # Hardcoded to No because removing snapshots will break the production image.
+    # $removeSnapshot = myDialogBox -Title "Remove snapshot:" -Prompt "Do you want to remove snapshots from the VM?" -Values Yes, No
+    $removeSnapshot = 'No'
 
-if ($removeSnapshot -eq 'Yes') {
-    # Removes snapshots from VM if $removeSnapshot variable is Yes
-    Get-Snapshot $vm | Remove-Snapshot -Confirm:$false
+    if ($removeSnapshot -eq 'Yes') {
+        # Removes snapshots from VM if $removeSnapshot variable is Yes
+        $null = Get-Snapshot -Server $Configuration.VIServer -VM $VM | Remove-Snapshot -Confirm:$false
+    }
+
+    # Hardcoded to OVA so that only a single file exists. OVFs output several files in a subfolder.
+    # $exportType = myDialogBox -Title "Select a format:" -Prompt "Please select the output format:" -Values OVA, OVF
+    $exportType = 'OVA'
+
+    # Creates timestamped filename with the VM name as an OVA file
+    $saveToPath = "$DD\$VM-$(Get-Date -Format 'yyyyMMddHHmmss').ova"
+ 
+    try {
+        # Exports VM to destination in specified format
+        $null = Export-VApp -Server $Configuration.VIServer -VM $VM -Destination "$saveToPath" -Format $exportType -ErrorAction Stop # Stop exists without trying, SilentlyContinue keeps going without catching
+    } catch [VMware.VimAutomation.Sdk.Types.V1.ErrorHandling.VimException.ViServerConnectionException] {
+        $null = Export-VApp -VM $VM -Destination "$saveToPath" -Format $exportType -ErrorAction SilentlyContinue #OnError exists without trying, SilentlyContinue keeps going without catching
+        $Configuration.ScriptErrors += "WARNING: Verify that VM exported correctly. The vCenter disconnected during export. $_"
+    } catch {
+        $Configuration.ScriptErrors += "ERROR: An unexpected error occurred. $_"
+    } Finally {
+        $null = Get-ChildItem -Path $DD -Filter "$VM*.ova" -File | # get files that start with the VM name and have the extension ".ova"
+        Where-Object { $_.BaseName -match '-\d{14}$' } | # that end with a dash followed by 14 digits
+        Sort-Object -Property @{Expression = { $_.BaseName.Substring(14) } } -Descending | # sort on the last 14 digits descending
+        Select-Object -Skip $retain | # select them all except for the last $retain
+        Remove-Item -Force #-WhatIf                                                      # delete selected files
+
+    }
 }
-
-# Hardcoded to OVA so that only a single file exists. OVFs output several files in a subfolder.
-# $exportType = myDialogBox -Title "Select a format:" -Prompt "Please select the output format:" -Values OVA, OVF
-$exportType = 'OVA'
 
 # Determines where vCenter is and only exports to same DC DataDomain
 if ($vCenter -in $vCentersOH) {
@@ -286,52 +320,72 @@ if ($vCenter -in $vCentersOH) {
     $dataDomain = $DataDomainTX
 }
 
-# Creates timestamped filename with the VM name as an OVA file
-$filenamePrefix = $vm + '-' + $(Get-Date -Format 'yyyyMMddHHmmss')
-$filename = $filenamePrefix + '.ova'
-#$hashFilename = $filenamePrefix + ".md5"
-
 # Creates connection to appropriate DataDomain
-New-PSDrive -Name 'DataDomain' -Root $dataDomain -PSProvider 'FileSystem' -Credential $Cred
-$saveToPath = $dataDomain + '\' + $filename
-#$saveHashToPath = $dataDomain + "\" + $hashFilename
+$null = New-PSDrive -Name 'DataDomain' -Root $dataDomain -PSProvider 'FileSystem' -Credential $Cred
+
+# Create runspace pool for parralelization
+$SessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+$RunspacePool = [RunspaceFactory]::CreateRunspacePool(1, $MaxRunspaces, $SessionState, $Host)
+$RunspacePool.Open()
+
+$Jobs = New-Object System.Collections.ArrayList
+
+# Display progress bar
+Write-Progress -Id 1 -Activity 'Creating Runspaces' -Status "Creating runspaces for $($VMs.Count) templates." -PercentComplete 0
 
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-try {
-    # Exports VM to destination in specified format
-    Export-VApp -VM $vm -Destination "$saveToPath" -Format $exportType -ErrorAction Stop # Stop exists without trying, SilentlyContinue keeps going without catching
-    # Creating the MD5 hash adds approximately 25 min runtime for an 18GB file. Commented out to speed up runtime.
-    #Get-FileHash "$saveToPath" -Algorithm MD5 | Format-Table Algorithm, Hash | Out-File -FilePath "$saveHashToPath"
-} catch [VMware.VimAutomation.Sdk.Types.V1.ErrorHandling.VimException.ViServerConnectionException] {
-    $message = $_
-    Export-VApp -VM $vm -Destination "$saveToPath" -Format $exportType -ErrorAction SilentlyContinue #OnError exists without trying, SilentlyContinue keeps going without catching
-    Write-Warning -Message "Verify that VM exported correctly. The vCenter disconnected during export. $message"
-} catch {
-    $message = $_
-    Write-Error -Message 'An unexpected error occurred.'
-} Finally {
-    Get-ChildItem -Path $dataDomain -Filter "$vm*.ova" -File | # get files that start with the VM name and have the extension ".ova"
-    Where-Object { $_.BaseName -match '-\d{14}$' } | # that end with a dash followed by 14 digits
-    Sort-Object -Property @{Expression = { $_.BaseName.Substring(14) } } -Descending | # sort on the last 14 digits descending
-    Select-Object -Skip $retain | # select them all except for the last $retain
-    Remove-Item -Force #-WhatIf                                                      # delete selected files
 
-    <# Removed because script no longer calculates checksum
-Get-ChildItem -Path $dataDomain -Filter "$vm*.md5" -File |      # get files that start with the VM name and have the extension ".md5"
-    Where-Object { $_.BaseName -match "-\d{14}$" } |                                 # that end with a dash followed by 14 digits
-    Sort-Object -Property @{Expression = {$_.BaseName.Substring(14)}} -Descending |  # sort on the last 14 digits descending
-    Select-Object -Skip $retain |                                                    # select them all except for the last $retain
-    Remove-Item -Force #-WhatIf                                                      # delete selected files
-#>
+$VMindex = 1
+# Create job for each VM
+foreach ($VirtualMachine in $VMs) {
+    $PowerShell = [powershell]::Create()
+    $PowerShell.RunspacePool = $RunspacePool
+    $null = $PowerShell.AddScript($Worker).AddArgument($VirtualMachine).AddArgument($dataDomain).AddArgument($Configuration)
+    
+    $JobObj = New-Object -TypeName PSObject -Property @{
+        Runspace   = $PowerShell.BeginInvoke()
+        PowerShell = $PowerShell  
+    }
 
-    # Disconnect from DataDomain
-    Remove-PSDrive -Name 'DataDomain'
+    $null = $Jobs.Add($JobObj)
+    $RSPercentComplete = ($VMindex / $VMs.Count ).ToString('P')
+    Write-Progress -Id 1 -Activity "Runspace creation: Processing $VirtualMachine" -Status "$VMindex/$($VMs.Count) : $RSPercentComplete Complete" -PercentComplete $RSPercentComplete.Replace('%', '')
 
-    # Disconnect from vCenter
-    Disconnect-VIServer * -Confirm:$false
-
-    $wshell = New-Object -ComObject Wscript.Shell
-    $elapsedMinutes = $stopwatch.Elapsed.TotalMinutes
-    $wshell.Popup("Operation Completed in $elapsedMinutes minutes", 0, 'Done', 0)
+    $VMindex++
 }
+Write-Progress -Id 1 -Activity 'Runspace creation' -Completed
+
+# Used to determine percentage completed.
+$TotalJobs = $Jobs.Runspace.Count
+
+Write-Progress -Id 2 -Activity 'Export Templates' -Status 'Exporting templates.' -PercentComplete 0
+
+# Updated percentage complete and wait until all jobs are finished.
+while ($Jobs.Runspace.IsCompleted -contains $false) {
+    $CompletedJobs = ($Jobs.Runspace.IsCompleted -eq $true).Count
+    $PercentComplete = ($CompletedJobs / $TotalJobs ).ToString('P')
+    Write-Progress -Id 2 -Activity 'Export Templates' -Status "$CompletedJobs/$TotalJobs : $PercentComplete Complete" -PercentComplete $PercentComplete.Replace('%', '')
+    Start-Sleep -Milliseconds 100
+}
+
+# Disconnect from vCenter
+Disconnect-VIServer -Server $VIServer -Force -Confirm:$false
+
+# Clean up runspace.
+$RunspacePool.Close()
+
+Write-Progress -Id 2 -Activity 'Export Templates' -Completed
+
+# Disconnect from DataDomain
+$null = Remove-PSDrive -Name 'DataDomain'
+
+# Write script errors to log file
+if (Test-Path -Path $ScriptErrors -PathType leaf) { Clear-Content -Path $ScriptErrors }
+Add-Content -Path $ScriptErrors -Value $Configuration.ScriptErrors
+
+Write-Host "Script error log saved to $ScriptErrors"
+
+$wshell = New-Object -ComObject Wscript.Shell
+$elapsedMinutes = $stopwatch.Elapsed.TotalMinutes
+$wshell.Popup("Operation Completed in $elapsedMinutes minutes", 0, 'Done', 0)
 #####END OF SCRIPT#######
