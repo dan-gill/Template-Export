@@ -11,7 +11,14 @@
 $PSModulePath = "$Env:SystemDrive\PowerCLIModule\"
 # Import settings from settings.json file
 $Settings = Get-Content "$PSScriptRoot\settings.json" -Raw | ConvertFrom-Json
-#$MaxRunspaces = $Settings.General.MaxRunspaces
+# Match any case of {3 to 4 character mneumonic}-view*, {3 to 4 character mneumonic}-ctx-appmx*
+# Mneumonic must only contain letters from the English alphabet
+$regexPattern = '^[a-zA-Z]{3,4}-(?:[Vv][Ii][Ee][Ww]|[Cc][Tt][Xx]-[Aa][Pp][Pp][Mm][Xx]).*$'
+# Create path if it doesn't already exist
+$SavePath = "$Env:SystemDrive\CWave\Export-Templates"
+if (!(Test-Path -Path $SavePath)) { $null = New-Item -Path "$SavePath" -ItemType Directory -Force }
+# Script log file
+$ScriptResults = "$SavePath\$(Get-Date -f yyyy-MM-dd)_ScriptResults.log"
 # Ohio vCenters
 $vCentersOH = $Settings.vCenters.vCentersOH
 # Texas vCenters
@@ -19,20 +26,11 @@ $vCentersTX = $Settings.vCenters.vCentersTX
 # Synchronized hashtable
 $Configuration = [hashtable]::Synchronized(@{})
 $Configuration.ScriptResults = @()
-# Delete path if it already exists
-$SavePath = "$Env:SystemDrive\CWave\Export-Templates"
-if (Test-Path -Path $SavePath) { Remove-Item -Path "$SavePath" -Recurse -Force }
-$null = New-Item -Path "$SavePath" -ItemType Directory -Force
-$ScriptResults = "$SavePath\$(Get-Date -f yyyy-MM-dd)_ScriptResults.log"
 # DataDomain password
 $Cred = New-Object System.Management.Automation.PSCredential ($Settings.DataDomain.username, (ConvertTo-SecureString $Settings.DataDomain.passwd -AsPlainText -Force))
 # DataDomains
 $DataDomainOH = $Settings.DataDomain.DataDomainOH
 $DataDomainTX = $Settings.DataDomain.DataDomainTX
-# Match any case of {3 to 4 character mneumonic}-view*, {3 to 4 character mneumonic}-ctx-appmx*
-# Mneumonic must only contain letters from the English alphabet
-$regexPattern = '^[a-zA-Z]{3,4}-(?:[Vv][Ii][Ee][Ww]|[Cc][Tt][Xx]-[Aa][Pp][Pp][Mm][Xx]).*$'
-
 # Number of backups to retain
 $retain = $Settings.General.RetainedCopies
 
@@ -184,78 +182,11 @@ $null = Set-PowerCLIConfiguration -InvalidCertificateAction Warn -Scope Session 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# Create a dialog box for connecting to vCenter and listing VMs from vCenter
-function myDialogBox {
-
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory)]
-        [string[]]$Title,
-        [Parameter(Mandatory)]
-        [string[]]$Prompt,
-        [Parameter(Mandatory)]
-        [string[]]$Values
-    )
-
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = $Title
-    $form.Size = New-Object System.Drawing.Size(300, 200)
-    $form.StartPosition = 'CenterScreen'
-
-    $okButton = New-Object System.Windows.Forms.Button
-    $okButton.Location = New-Object System.Drawing.Point(75, 120)
-    $okButton.Size = New-Object System.Drawing.Size(75, 23)
-    $okButton.Text = 'OK'
-    $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
-    $form.AcceptButton = $okButton
-    $form.Controls.Add($okButton)
-
-    $cancelButton = New-Object System.Windows.Forms.Button
-    $cancelButton.Location = New-Object System.Drawing.Point(150, 120)
-    $cancelButton.Size = New-Object System.Drawing.Size(75, 23)
-    $cancelButton.Text = 'Cancel'
-    $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $form.CancelButton = $cancelButton
-    $form.Controls.Add($cancelButton)
-
-    $label = New-Object System.Windows.Forms.Label
-    $label.Location = New-Object System.Drawing.Point(10, 20)
-    $label.Size = New-Object System.Drawing.Size(280, 20)
-    $label.Text = $Prompt
-    $form.Controls.Add($label)
-
-    $listBox = New-Object System.Windows.Forms.ListBox
-    $listBox.Location = New-Object System.Drawing.Point(10, 40)
-    $listBox.Size = New-Object System.Drawing.Size(260, 20)
-    $listBox.Height = 80
-
-    foreach ($value in $Values)
-    { [void] $listBox.Items.Add($value) }
-
-    $form.Controls.Add($listBox)
-
-    $form.Topmost = $true
-
-    $result = $form.ShowDialog()
-
-    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-        $x = $listBox.SelectedItem
-        return $x
-    } else {
-        # The user canceled, so exit the script. If the user canceled after connecting to vCenter, disconnect first.
-        try {
-            Disconnect-VIServer * -Confirm:$false
-            Write-Warning 'User canceled dialog box. Exiting script.'
-        } catch { Write-Warning 'Exiting before selecting a vCenter.' }
-        finally { Exit }
-    }
-    
-}
-
+# Script block that performs the work on each VM
 $Worker = {
-    param($VISrvr, $VM, $DD, $Configuration)
+    param($VM, $DD, $Configuration)
     # Make sure VM does not have any ISOs attached to it
-    $null = Get-VM -Server $VISrvr -Name $VM | Get-CDDrive | Set-CDDrive -NoMedia -Confirm:$false
+    $null = Get-VM -Server $VM.VIServer -Name $VM | Get-CDDrive | Set-CDDrive -NoMedia -Confirm:$false
 
     # Hardcoded to OVA so that only a single file exists. OVFs output several files in a subfolder.
     $exportType = 'OVA'
@@ -265,11 +196,11 @@ $Worker = {
  
     try {
         # Exports VM to destination in specified format
-        $null = Export-VApp -Server $VISrvr -VM $VM -Destination "$saveToPath" -Format $exportType -ErrorAction Stop # Stop exists without trying, SilentlyContinue keeps going without catching
-        $Configuration.ScriptResults += "INFO: Finished exporting $VM on $VISrvr."
+        $null = Export-VApp -Server $VM.VIServer -VM $VM -Destination "$saveToPath" -Format $exportType -ErrorAction Stop # Stop exists without trying, SilentlyContinue keeps going without catching
+        $Configuration.ScriptResults += "INFO: Finished exporting $VM on $($VM.VIServer)."
     } catch [VMware.VimAutomation.Sdk.Types.V1.ErrorHandling.VimException.ViServerConnectionException] {
-        $null = Export-VApp -Server $VISrvr -VM $VM -Destination "$saveToPath" -Format $exportType -ErrorAction SilentlyContinue #OnError exists without trying, SilentlyContinue keeps going without catching
-        $Configuration.ScriptResults += "WARNING: Finished exporting $VM on $VISrvr. Verify that VM exported correctly. The vCenter disconnected during export. $_"
+        $null = Export-VApp -Server $VM.VIServer -VM $VM -Destination "$saveToPath" -Format $exportType -ErrorAction SilentlyContinue #OnError exists without trying, SilentlyContinue keeps going without catching
+        $Configuration.ScriptResults += "WARNING: Finished exporting $VM on $($VM.VIServer). Verify that VM exported correctly. The vCenter disconnected during export. $_"
     } catch {
         $Configuration.ScriptResults += "ERROR: An unexpected error occurred. $_"
     } Finally {
@@ -284,6 +215,8 @@ $Worker = {
 # Creates connection to appropriate DataDomain
 $null = New-PSDrive -Name 'DataDomain' -Root $dataDomain -PSProvider 'FileSystem' -Credential $Cred
 
+$VMs = $null
+
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 foreach ($vCenter in $vCenters) {
@@ -292,61 +225,68 @@ foreach ($vCenter in $vCenters) {
     while (!$VIServer) { $VIServer = Connect-VIServer $vCenter }
     
     # Retrieve list of powered off VMs formatted according to $regexPattern variable
-    $VMs = Get-VM -Server $VIServer | Where-Object { $_.PowerState -eq 'PoweredOff' -and $_.Name -match $regexPattern }
-    $MaxRunspaces = (Get-VMHost -Server $VIServer -VM $VMs -ErrorAction SilentlyContinue | Sort-Object | Get-Unique).Count
-
-    # Create runspace pool for parralelization
-    $SessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-    $RunspacePool = [RunspaceFactory]::CreateRunspacePool(1, $MaxRunspaces, $SessionState, $Host)
-    $RunspacePool.Open()
-
-    $Jobs = New-Object System.Collections.ArrayList
-
-    # Display progress bar
-    Write-Progress -Id 1 -Activity 'Creating Runspaces' -Status "Creating runspaces for $($VMs.Count) templates on $vCenter." -PercentComplete 0
-
-    $VMindex = 1
-    # Create job for each VM
-    foreach ($VirtualMachine in $VMs) {
-        $PowerShell = [powershell]::Create()
-        $PowerShell.RunspacePool = $RunspacePool
-        $null = $PowerShell.AddScript($Worker).AddArgument($VIServer).AddArgument($VirtualMachine).AddArgument($dataDomain).AddArgument($Configuration)
-        
-        $JobObj = New-Object -TypeName PSObject -Property @{
-            Runspace   = $PowerShell.BeginInvoke()
-            PowerShell = $PowerShell  
-        }
-    
-        $null = $Jobs.Add($JobObj)
-        $RSPercentComplete = ($VMindex / $VMs.Count ).ToString('P')
-        Write-Progress -Id 1 -Activity "Runspace creation: Processing $VirtualMachine on $vCenter" -Status "$VMindex/$($VMs.Count) : $RSPercentComplete Complete" -PercentComplete $RSPercentComplete.Replace('%', '')
-    
-        $VMindex++
-    }
-    Write-Progress -Id 1 -Activity 'Runspace creation' -Completed
-    
-    # Used to determine percentage completed.
-    $TotalJobs = $Jobs.Runspace.Count
-    
-    Write-Progress -Id 2 -Activity "Export Templates on $vCenter" -Status 'Exporting templates.' -PercentComplete 0
-    
-    # Updated percentage complete and wait until all jobs are finished.
-    while ($Jobs.Runspace.IsCompleted -contains $false) {
-        $CompletedJobs = ($Jobs.Runspace.IsCompleted -eq $true).Count
-        $PercentComplete = ($CompletedJobs / $TotalJobs ).ToString('P')
-        Write-Progress -Id 2 -Activity "Export Templates on $vCenter" -Status "$CompletedJobs/$TotalJobs : $PercentComplete Complete" -PercentComplete $PercentComplete.Replace('%', '')
-        Start-Sleep -Milliseconds 100
-    }
-    
-    # Disconnect from vCenter
-    Disconnect-VIServer -Server $VIServer -Force -Confirm:$false
-    
-    # Clean up runspace.
-    $RunspacePool.Close()
-    
-    Write-Progress -Id 2 -Activity "Export Templates on $vCenter" -Completed
-    
+    $prelimVMs = Get-VM -Server $VIServer | Where-Object { $_.PowerState -eq 'PoweredOff' -and $_.Name -match $regexPattern }
+    $prelimVMs | Add-Member -MemberType NoteProperty -Name 'VIServer' $VIServer
+    $VMs += $prelimVMs
 }
+
+$VMs = $VMs | Sort-Object
+$VIServers = $VMs.VIServer | Sort-Object | Get-Unique
+$MaxRunspaces = (Get-VMHost -Server $VMs.VIServer -VM $VMs -ErrorAction SilentlyContinue | Sort-Object | Get-Unique).Count
+$TotalVMs = $VMs.Count
+
+# Create runspace pool for parralelization
+$SessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+$RunspacePool = [RunspaceFactory]::CreateRunspacePool(1, $MaxRunspaces, $SessionState, $Host)
+$RunspacePool.Open()
+
+$Jobs = New-Object System.Collections.ArrayList
+
+# Display progress bar
+Write-Progress -Id 1 -Activity 'Creating Runspaces' -Status "Creating runspaces for $TotalVMs templates." -PercentComplete 0
+
+$VMindex = 1
+# Create job for each VM
+foreach ($VirtualMachine in $VMs) {
+    $PowerShell = [powershell]::Create()
+    $PowerShell.RunspacePool = $RunspacePool
+    $null = $PowerShell.AddScript($Worker).AddArgument($VirtualMachine).AddArgument($dataDomain).AddArgument($Configuration)
+    
+    $JobObj = New-Object -TypeName PSObject -Property @{
+        Runspace   = $PowerShell.BeginInvoke()
+        PowerShell = $PowerShell  
+    }
+
+    $null = $Jobs.Add($JobObj)
+    $RSPercentComplete = ($VMindex / $TotalVMs ).ToString('P')
+    Write-Progress -Id 1 -Activity "Runspace creation: Processing $VirtualMachine on $($VirtualMachine.VIServer)" -Status "$VMindex/$TotalVMs : $RSPercentComplete Complete" -PercentComplete $RSPercentComplete.Replace('%', '')
+
+    $VMindex++
+}
+Write-Progress -Id 1 -Activity 'Runspace creation' -Completed
+
+# Used to determine percentage completed.
+$TotalJobs = $Jobs.Runspace.Count
+
+Write-Progress -Id 2 -Activity 'Export Templates' -Status 'Exporting templates.' -PercentComplete 0
+
+# Updated percentage complete and wait until all jobs are finished.
+while ($Jobs.Runspace.IsCompleted -contains $false) {
+    $CompletedJobs = ($Jobs.Runspace.IsCompleted -eq $true).Count
+    $PercentComplete = ($CompletedJobs / $TotalJobs ).ToString('P')
+    Write-Progress -Id 2 -Activity 'Export Templates' -Status "$CompletedJobs/$TotalJobs : $PercentComplete Complete" -PercentComplete $PercentComplete.Replace('%', '')
+    Start-Sleep -Seconds 10
+}
+
+# Disconnect from vCenter
+foreach ($VIServer in $VIServers) {
+    $null = Disconnect-VIServer -Server $VIServer -Force -Confirm:$false
+}
+
+# Clean up runspace.
+$RunspacePool.Close()
+
+Write-Progress -Id 2 -Activity 'Export Templates' -Completed
 
 # Disconnect from DataDomain
 $null = Remove-PSDrive -Name 'DataDomain'
@@ -359,5 +299,5 @@ Write-Host "Script log saved to $ScriptResults"
 
 $wshell = New-Object -ComObject Wscript.Shell
 $elapsedMinutes = $stopwatch.Elapsed.TotalMinutes
-$wshell.Popup("$TotalJobs templates exported in $elapsedMinutes minutes. Average $($elapsedMinutes/$TotalJobs) minutes per template.", 0, 'Done', 0)
+$wshell.Popup("$TotalVMs templates exported in $elapsedMinutes minutes. Average $($elapsedMinutes/$TotalVMs) minutes per template.", 0, 'Done', 0)
 #####END OF SCRIPT#######
