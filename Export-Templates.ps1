@@ -1,8 +1,26 @@
-﻿# Created by Dan Gill
-# Date: August 26, 2021
-# Purpose: Use a dialog box to export OVF/OVA template from selected vCenter server.
-# Dependencies: Uses Windows credentials to connect to vCenter server.
-
+﻿<#
+.SYNOPSIS
+    A script to automate VM exports.
+.DESCRIPTION
+    This script automates VM exports on VMware. The settings.json file
+    specifies the variables needed. The script calculates the number of
+    distinct ESX hosts the VMs reside on to determine a dynamic max runspace
+    count. It then threads the export. The script outputs a log to $SavePath.
+.NOTES
+    File Name  : Export-Templates.ps1
+    Author     : Dan Gill - dgill@gocloudwave.com
+    Requires   : settings.json in the same directory.
+.LINK
+    https://xkln.net/blog/multithreading-in-powershell--running-a-specific-number-of-threads/
+.EXAMPLE
+    ./Export-Templates.ps1
+.INPUTS
+   None. Export-Templates.ps1 obtains information from settings.json.
+.OUTPUTS
+   Exports VMs as OVA to location specified in settings.json
+.EXAMPLE
+   PS> .\Export-Templates.ps1
+#>
 
 #######################
 # Configure the variables below
@@ -18,7 +36,7 @@ $regexPattern = '^[a-zA-Z]{3,4}-(?:[Vv][Ii][Ee][Ww]|[Cc][Tt][Xx]-[Aa][Pp][Pp][Mm
 $SavePath = "$Env:SystemDrive\CWave\Export-Templates"
 if (!(Test-Path -Path $SavePath)) { $null = New-Item -Path "$SavePath" -ItemType Directory -Force }
 # Script log file
-$ScriptResults = "$SavePath\$(Get-Date -f yyyy-MM-dd)_ScriptResults.log"
+$ScriptResults = "$SavePath\$(Get-Date -Format FileDateTimeUniversal)_ScriptResults.log"
 # Ohio vCenters
 $vCentersOH = $Settings.vCenters.vCentersOH
 # Texas vCenters
@@ -44,7 +62,7 @@ if ($env:computername -match '^[Tt][Xx][Oo][Ss]-[Ee][Nn][Gg]\d{2}$') {
     $vCenters = $vCentersOH
     $dataDomain = $DataDomainOH
 } else {
-    Write-Error -Message "You must run this script from a VDI in OH or TX.`r`nExamples: OPSUS-ENG-12, OHOS-ENG-35, or TXOS-ENG97" -Category PermissionDenied
+    $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) ERROR: You must run this script from a VDI in OH or TX. Examples: OPSUS-ENG-12, OHOS-ENG-35, or TXOS-ENG97"
     Exit 10              # Exiting script
 }
 
@@ -52,6 +70,7 @@ if ($env:computername -match '^[Tt][Xx][Oo][Ss]-[Ee][Nn][Gg]\d{2}$') {
 # Nothing to change below this line, commented throughout to explain
 #####################################################################
 
+# If VMware.PowerCLI isn't installed, then install it
 if (!(Get-Module -ListAvailable -Name VMware.PowerCLI)) {
     #######################
     # Testing if TLS 1.2 or above is enabled
@@ -84,7 +103,7 @@ if (!(Get-Module -ListAvailable -Name VMware.PowerCLI)) {
         #######################
         # Exit and ask user to re-run the script
         #######################
-        Write-Warning 'This system did not have TLS 1.2 or above enabled. Please re-run the script so that the changes to enable TLS 1.2 and above take effect.'
+        $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) WARNING: This system did not have TLS 1.2 or above enabled. Please re-run the script so that the changes to enable TLS 1.2 and above take effect."
         Exit
     }
   
@@ -110,7 +129,7 @@ if (!(Get-Module -ListAvailable -Name VMware.PowerCLI)) {
         # Checking return value for success
         $PowerCLIUninstallValue = $PowerCLIUninstall.ReturnValue
         if ($PowerCLIUninstallValue -ne 0) {
-            Write-Error -Message 'Uninstall Of PowerCLI Failed - Most likely due to not running as administrator' -Category PermissionDenied
+            $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) ERROR: Uninstall Of PowerCLI Failed - Most likely due to not running as administrator"
         }
         # Finished uninstall
         Write-Progress -Id 2 -ParentId 1 -Activity 'PowerCLI in Program Files' -Completed
@@ -168,15 +187,15 @@ if (!(Get-Module -ListAvailable -Name VMware.PowerCLI)) {
         # Outputting result
         #######################
         if ($PowerCLIImportTest) {
-            Write-Information 'New PowerCLI Module Successfully Installed'
+            $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) INFO: New PowerCLI Module Successfully Installed"
         } else {
-            Write-Error -Message "Something went wrong! Maybe you, maybe me. Does this computer have internet access and did you run as administrator?`r`nTry installing PowerCLI in offline mode (Procedure 3): https://tinyurl.com/VMware-PowerCLI"
+            $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) ERROR: Something went wrong! Maybe you, maybe me. Does this computer have internet access and did you run as administrator?`r`nTry installing PowerCLI in offline mode (Procedure 3): https://tinyurl.com/VMware-PowerCLI"
             Exit 22
         }
     }
 }
-# Warn if the Certificate is invalid, but continue
-$null = Set-PowerCLIConfiguration -InvalidCertificateAction Warn -Scope Session -Confirm:$false
+# Ignore invalid certificate warnings
+$null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Scope Session -Confirm:$false
 
 # Needed for dialog boxes
 Add-Type -AssemblyName System.Windows.Forms
@@ -192,21 +211,20 @@ $Worker = {
     $exportType = 'OVA'
 
     # Creates timestamped filename with the VM name as an OVA file
-    $saveToPath = "$DD\$VM-$(Get-Date -Format 'yyyyMMddHHmmss').$($exportType.ToLower())"
+    $saveToPath = "$DD\$VM-$(Get-Date -Format FileDateTimeUniversal).$($exportType.ToLower())"
  
     try {
         # Exports VM to destination in specified format
         $null = Export-VApp -Server $VM.VIServer -VM $VM -Destination "$saveToPath" -Format $exportType -ErrorAction Stop # Stop exists without trying, SilentlyContinue keeps going without catching
-        $Configuration.ScriptResults += "INFO: Finished exporting $VM on $($VM.VIServer)."
+        $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) INFO: Finished exporting $VM on $($VM.VIServer)."
     } catch [VMware.VimAutomation.Sdk.Types.V1.ErrorHandling.VimException.ViServerConnectionException] {
         $null = Export-VApp -Server $VM.VIServer -VM $VM -Destination "$saveToPath" -Format $exportType -ErrorAction SilentlyContinue #OnError exists without trying, SilentlyContinue keeps going without catching
-        $Configuration.ScriptResults += "WARNING: Finished exporting $VM on $($VM.VIServer). Verify that VM exported correctly. The vCenter disconnected during export. $_"
+        $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) WARNING: Finished exporting $VM on $($VM.VIServer). Verify that VM exported correctly. The vCenter disconnected during export. $_"
     } catch {
-        $Configuration.ScriptResults += "ERROR: An unexpected error occurred. $_"
+        $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) ERROR: An unexpected error occurred. $_"
     } Finally {
-        $null = Get-ChildItem -Path $DD -Filter "$VM*.$($exportType.ToLower())" -File | # get files that start with the VM name and have the extension ".ova"
-        Where-Object { $_.BaseName -match '-\d{14}$' } | # that end with a dash followed by 14 digits
-        Sort-Object -Property @{Expression = { $_.BaseName.Substring(14) } } -Descending | # sort on the last 14 digits descending
+        $null = Get-ChildItem -Path $DD -Filter "$VM-*.$($exportType.ToLower())" -File | # get files that start with the VM name and have the extension ".ova"
+        Sort-Object -Property @{Expression = { $_.BaseName.Substring(20) } } -Descending | # sort on the last 20 characters descending
         Select-Object -Skip $retain | # select them all except for the last $retain
         Remove-Item -Force #-WhatIf                                                      # delete selected files
     }
@@ -226,12 +244,15 @@ foreach ($vCenter in $vCenters) {
     
     # Retrieve list of powered off VMs formatted according to $regexPattern variable
     $prelimVMs = Get-VM -Server $VIServer | Where-Object { $_.PowerState -eq 'PoweredOff' -and $_.Name -match $regexPattern }
+    # Add VIServer connection details as member of VM details
     $prelimVMs | Add-Member -MemberType NoteProperty -Name 'VIServer' $VIServer
+    # Create list of VMs from all vCenters
     $VMs += $prelimVMs
 }
 
-$VMs = $VMs | Sort-Object
-$VIServers = $VMs.VIServer | Sort-Object | Get-Unique
+$VMs = $VMs | Sort-Object # Sort to disperse exports across more vCenters/ESX hosts
+$VIServers = $VMs.VIServer | Sort-Object | Get-Unique # Obtain list of VIServers for disconnect later
+# Set runspace max to count of distinct ESX hosts
 $MaxRunspaces = (Get-VMHost -Server $VMs.VIServer -VM $VMs -ErrorAction SilentlyContinue | Sort-Object | Get-Unique).Count
 $TotalVMs = $VMs.Count
 
@@ -278,7 +299,10 @@ while ($Jobs.Runspace.IsCompleted -contains $false) {
     Start-Sleep -Seconds 10
 }
 
-# Disconnect from vCenter
+# Add final export summary
+$Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) $TotalVMs templates exported in $($stopwatch.Elapsed.Hours):$($stopwatch.Elapsed.Minutes):$($stopwatch.Elapsed.Seconds) (hh:mm:ss). Average $(($stopwatch.Elapsed.TotalMinutes/$TotalVMs).ToString('#.##')) minutes per template."
+
+# Disconnect from vCenter(s)
 foreach ($VIServer in $VIServers) {
     $null = Disconnect-VIServer -Server $VIServer -Force -Confirm:$false
 }
@@ -291,13 +315,8 @@ Write-Progress -Id 2 -Activity 'Export Templates' -Completed
 # Disconnect from DataDomain
 $null = Remove-PSDrive -Name 'DataDomain'
 
-# Write script errors to log file
+# Write script results to log file
 if (Test-Path -Path $ScriptResults -PathType leaf) { Clear-Content -Path $ScriptResults }
 Add-Content -Path $ScriptResults -Value $Configuration.ScriptResults
 
-Write-Host "Script log saved to $ScriptResults"
-
-$wshell = New-Object -ComObject Wscript.Shell
-$elapsedMinutes = $stopwatch.Elapsed.TotalMinutes
-$wshell.Popup("$TotalVMs templates exported in $elapsedMinutes minutes. Average $($elapsedMinutes/$TotalVMs) minutes per template.", 0, 'Done', 0)
 #####END OF SCRIPT#######
