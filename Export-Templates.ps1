@@ -250,7 +250,7 @@ foreach ($vCenter in $vCenters) {
     $VMs += $prelimVMs
 }
 
-$VMs = $VMs | Sort-Object # Sort to disperse exports across more vCenters/ESX hosts
+$VMs = $VMs | Sort-Object { Get-Random } # Randomize to disperse exports across more vCenters/ESX hosts
 $VIServers = $VMs.VIServer | Sort-Object | Get-Unique # Obtain list of VIServers for disconnect later
 # Set runspace max to count of distinct ESX hosts
 $MaxRunspaces = (Get-VMHost -Server $VMs.VIServer -VM $VMs -ErrorAction SilentlyContinue | Sort-Object | Get-Unique).Count
