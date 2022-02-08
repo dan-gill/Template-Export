@@ -37,6 +37,8 @@ $SavePath = "$Env:SystemDrive\CWave\Export-Templates"
 if (!(Test-Path -Path $SavePath)) { $null = New-Item -Path "$SavePath" -ItemType Directory -Force }
 # Script log file
 $ScriptResults = "$SavePath\$(Get-Date -Format FileDateTimeUniversal)_ScriptResults.log"
+# Threads - If an integer, it will use this for runspace count.
+$Threads = $Settings.General.Threads
 # Ohio vCenters
 $vCentersOH = $Settings.vCenters.vCentersOH
 # Texas vCenters
@@ -62,7 +64,9 @@ if ($env:computername -match '^[Tt][Xx][Oo][Ss]-[Ee][Nn][Gg]\d{2}$') {
     $vCenters = $vCentersOH
     $dataDomain = $DataDomainOH
 } else {
-    $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) ERROR: You must run this script from a VDI in OH or TX. Examples: OPSUS-ENG-12, OHOS-ENG-35, or TXOS-ENG97"
+    $Configuration.ScriptResults += "$(Get-Date -Format U) UTC - ERROR: You must run this script from a VDI in OH or TX. Examples: OPSUS-ENG-12, OHOS-ENG-35, or TXOS-ENG97"
+    if (Test-Path -Path $ScriptResults -PathType leaf) { Clear-Content -Path $ScriptResults }
+    Add-Content -Path $ScriptResults -Value $Configuration.ScriptResults
     Exit 10              # Exiting script
 }
 
@@ -104,6 +108,8 @@ if (!(Get-Module -ListAvailable -Name VMware.PowerCLI)) {
         # Exit and ask user to re-run the script
         #######################
         $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) WARNING: This system did not have TLS 1.2 or above enabled. Please re-run the script so that the changes to enable TLS 1.2 and above take effect."
+        if (Test-Path -Path $ScriptResults -PathType leaf) { Clear-Content -Path $ScriptResults }
+        Add-Content -Path $ScriptResults -Value $Configuration.ScriptResults
         Exit
     }
   
@@ -112,7 +118,7 @@ if (!(Get-Module -ListAvailable -Name VMware.PowerCLI)) {
     #######################
     $PSModulePathTest = Test-Path $PSModulePath
     if ($PSModulePathTest -eq $False) {
-        New-Item -ItemType Directory -Force -Path $PSModulePath
+        $null = New-Item -ItemType Directory -Force -Path $PSModulePath
     }
     #######################
     # Checking to see if PowerCLI is installed in Program Files, takes 5-30 seconds
@@ -138,18 +144,18 @@ if (!(Get-Module -ListAvailable -Name VMware.PowerCLI)) {
     #######################
     # Checking to see if the NuGet Package Provider is already installed
     #######################
-    $NuGetPackageProviderCheck = Get-PackageProvider -Name 'NuGet' -ListAvailable
+    $NuGetPackageProviderCheck = Get-PackageProvider -Name 'NuGet' -ListAvailable -ErrorAction SilentlyContinue
     #######################
     # If NuGet Provider is not installed, nothing found, then running install...
     #######################
     if (!$NuGetPackageProviderCheck) {
         Write-Progress -Id 1 -Activity 'NuGet Package Provider' -CurrentOperation 'Not Found - Installing'
         # Trusting PS Gallery to remove prompt on install
-        Set-PackageSource -Name 'PSGallery' -Trusted
+        $null = Set-PackageSource -Name 'PSGallery' -Trusted
         # Not installed, finding module online
-        Find-PackageProvider -Name 'NuGet' -AllVersions
+        $null = Find-PackageProvider -Name 'NuGet' -AllVersions -Force
         # Installing module
-        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Confirm:$false
+        $null = Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Confirm:$false
         Write-Progress -Id 1 -Activity 'NuGet Package Provider' -Completed
     }
     #######################
@@ -162,11 +168,11 @@ if (!(Get-Module -ListAvailable -Name VMware.PowerCLI)) {
     if (!$PowerCLIModuleCheck) {
         Write-Progress -Id 1 -Activity 'PowerCLI Module' -CurrentOperation 'Not Found - Installing'
         # Trusting PS Gallery to remove prompt on install
-        Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
+        $null = Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
         # Not installed, finding module online
-        Find-Module -Name 'VMware.PowerCLI'
+        $null = Find-Module -Name 'VMware.PowerCLI'
         # Installing module
-        Install-Module -Name 'VMware.PowerCLI' -Confirm:$false -AllowClobber -Force
+        $null = Install-Module -Name 'VMware.PowerCLI' -Confirm:$false -AllowClobber -Force
         # If running this is a repeat demo/test, you can uninstall the module using the below:
         # Uninstall-Module -Name VMware.PowerCLI -Confirm:$false
         Write-Progress -Id 1 -Activity 'PowerCLI Module' -Completed
@@ -190,12 +196,14 @@ if (!(Get-Module -ListAvailable -Name VMware.PowerCLI)) {
             $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) INFO: New PowerCLI Module Successfully Installed"
         } else {
             $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) ERROR: Something went wrong! Maybe you, maybe me. Does this computer have internet access and did you run as administrator?`r`nTry installing PowerCLI in offline mode (Procedure 3): https://tinyurl.com/VMware-PowerCLI"
+            if (Test-Path -Path $ScriptResults -PathType leaf) { Clear-Content -Path $ScriptResults }
+            Add-Content -Path $ScriptResults -Value $Configuration.ScriptResults
             Exit 22
         }
     }
 }
 # Ignore invalid certificate warnings
-$null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Scope Session -Confirm:$false
+$null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -DefaultVIServerMode Multiple -Scope Session -Confirm:$false
 
 # Needed for dialog boxes
 Add-Type -AssemblyName System.Windows.Forms
@@ -210,20 +218,24 @@ $Worker = {
     # Hardcoded to OVA so that only a single file exists. OVFs output several files in a subfolder.
     $exportType = 'OVA'
 
-    # Creates timestamped filename with the VM name as an OVA file
+    # Creates timestamped filename with the VM name
     $saveToPath = "$DD\$VM-$(Get-Date -Format FileDateTimeUniversal).$($exportType.ToLower())"
  
     try {
         # Exports VM to destination in specified format
         $null = Export-VApp -Server $VM.VIServer -VM $VM -Destination "$saveToPath" -Format $exportType -ErrorAction Stop # Stop exists without trying, SilentlyContinue keeps going without catching
-        $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) INFO: Finished exporting $VM on $($VM.VIServer)."
+        $Configuration.ScriptResults += "$(Get-Date -Format U) UTC - INFO: Finished exporting $VM from $($VM.VIServer) on $($VM.VMHost)."
     } catch [VMware.VimAutomation.Sdk.Types.V1.ErrorHandling.VimException.ViServerConnectionException] {
         $null = Export-VApp -Server $VM.VIServer -VM $VM -Destination "$saveToPath" -Format $exportType -ErrorAction SilentlyContinue #OnError exists without trying, SilentlyContinue keeps going without catching
-        $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) WARNING: Finished exporting $VM on $($VM.VIServer). Verify that VM exported correctly. The vCenter disconnected during export. $_"
+        $Configuration.ScriptResults += "$(Get-Date -Format U) UTC - WARNING: Finished exporting $VM from $($VM.VIServer) on $($VM.VMHost). Verify that VM exported correctly. The vCenter disconnected during export. $_"
+    } catch [VMware.VimAutomation.ViCore.Types.V1.ErrorHandling.NotSupported] {
+        $Configuration.ScriptResults += "$(Get-Date -Format U) UTC - ERROR: Export-VApp not supported for $VM from $($VM.VIServer) on $($VM.VMHost)."
+    } catch [VMware.VimAutomation.ViCore.Types.V1.ErrorHandling.ManagedObjectNotFound] {
+        $Configuration.ScriptResults += "$(Get-Date -Format U) UTC - ERROR: $VM was deleted or could not be found while exporting from $($VM.VIServer) on $($VM.VMHost)."
     } catch {
-        $Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) ERROR: An unexpected error occurred. $_"
+        $Configuration.ScriptResults += "$(Get-Date -Format U) UTC - ERROR: An unexpected error occurred exporting $VM from $($VM.VIServer) on $($VM.VMHost). Full error name: $($Error[0].Exception.GetType().FullName). Message: $_"
     } Finally {
-        $null = Get-ChildItem -Path $DD -Filter "$VM-*.$($exportType.ToLower())" -File | # get files that start with the VM name and have the extension ".ova"
+        $null = Get-ChildItem -Path $DD -Filter "$VM-*.$($exportType.ToLower())" -File | # get files that start with the VM name and have the specifed extension
         Sort-Object -Property @{Expression = { $_.BaseName.Substring(20) } } -Descending | # sort on the last 20 characters descending
         Select-Object -Skip $retain | # select them all except for the last $retain
         Remove-Item -Force #-WhatIf                                                      # delete selected files
@@ -231,11 +243,18 @@ $Worker = {
 }
 
 # Creates connection to appropriate DataDomain
-$null = New-PSDrive -Name 'DataDomain' -Root $dataDomain -PSProvider 'FileSystem' -Credential $Cred
-
+try {
+    $null = New-PSDrive -Name 'DataDomain' -Root $dataDomain -PSProvider 'FileSystem' -Credential $Cred -ErrorAction Stop
+} catch {
+    $Configuration.ScriptResults += "$(Get-Date -Format U) UTC - ERROR: Unable to map DataDomain $dataDomain. $_"
+    if (Test-Path -Path $ScriptResults -PathType leaf) { Clear-Content -Path $ScriptResults }
+    Add-Content -Path $ScriptResults -Value $Configuration.ScriptResults
+    Exit 51
+}
 $VMs = $null
 
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$Configuration.ScriptResults += "$(Get-Date -Format U) UTC - INFO: Begin script execution."
 
 foreach ($vCenter in $vCenters) {
     # Connect to vCenter selected using logged on user credentials
@@ -244,6 +263,7 @@ foreach ($vCenter in $vCenters) {
     
     # Retrieve list of powered off VMs formatted according to $regexPattern variable
     $prelimVMs = Get-VM -Server $VIServer | Where-Object { $_.PowerState -eq 'PoweredOff' -and $_.Name -match $regexPattern }
+    $Configuration.ScriptResults += "$(Get-Date -Format U) UTC - INFO: Processing $($prelimVMs.Count) VMs from $vCenter."
     # Add VIServer connection details as member of VM details
     $prelimVMs | Add-Member -MemberType NoteProperty -Name 'VIServer' $VIServer
     # Create list of VMs from all vCenters
@@ -252,8 +272,10 @@ foreach ($vCenter in $vCenters) {
 
 $VMs = $VMs | Sort-Object { Get-Random } # Randomize to disperse exports across more vCenters/ESX hosts
 $VIServers = $VMs.VIServer | Sort-Object | Get-Unique # Obtain list of VIServers for disconnect later
-# Set runspace max to count of distinct ESX hosts
-$MaxRunspaces = (Get-VMHost -Server $VMs.VIServer -VM $VMs -ErrorAction SilentlyContinue | Sort-Object | Get-Unique).Count
+# If threads is an integer, use that for MaxRunspaces; otherwise, use the number of unique ESX hosts.
+if ( $Threads.GetType().Name -eq 'Int32' ) { $MaxRunspaces = $Threads }
+else { $MaxRunspaces = (Get-VMHost -Server $VMs.VIServer -VM $VMs -ErrorAction SilentlyContinue | Sort-Object | Get-Unique).Count }
+$Configuration.ScriptResults += "$(Get-Date -Format U) UTC - INFO: Processing $MaxRunspaces threads at a time."
 $TotalVMs = $VMs.Count
 
 # Create runspace pool for parralelization
@@ -300,7 +322,8 @@ while ($Jobs.Runspace.IsCompleted -contains $false) {
 }
 
 # Add final export summary
-$Configuration.ScriptResults += "$(Get-Date -Format FileDateTimeUniversal) $TotalVMs templates exported in $($stopwatch.Elapsed.Hours):$($stopwatch.Elapsed.Minutes):$($stopwatch.Elapsed.Seconds) (hh:mm:ss). Average $(($stopwatch.Elapsed.TotalMinutes/$TotalVMs).ToString('#.##')) minutes per template."
+$stopwatch.Stop()
+$Configuration.ScriptResults += "$(Get-Date -Format U) UTC - $TotalVMs templates exported in $($stopwatch.Elapsed.Hours.ToString("00")):$($stopwatch.Elapsed.Minutes.ToString("00")):$($stopwatch.Elapsed.Seconds.ToString("00")) (hh:mm:ss). Average $(($stopwatch.Elapsed.TotalMinutes/$TotalVMs).ToString('#.##')) minutes per template."
 
 # Disconnect from vCenter(s)
 foreach ($VIServer in $VIServers) {
