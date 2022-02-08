@@ -323,7 +323,7 @@ while ($Jobs.Runspace.IsCompleted -contains $false) {
 
 # Add final export summary
 $stopwatch.Stop()
-$Configuration.ScriptResults += "$(Get-Date -Format U) UTC - $TotalVMs templates exported in $($stopwatch.Elapsed.Hours.ToString("00")):$($stopwatch.Elapsed.Minutes.ToString("00")):$($stopwatch.Elapsed.Seconds.ToString("00")) (hh:mm:ss). Average $(($stopwatch.Elapsed.TotalMinutes/$TotalVMs).ToString('#.##')) minutes per template."
+$Configuration.ScriptResults += "$(Get-Date -Format U) UTC - $TotalVMs templates exported in $($stopwatch.Elapsed.Hours.ToString('00')):$($stopwatch.Elapsed.Minutes.ToString('00')):$($stopwatch.Elapsed.Seconds.ToString('00')) (hh:mm:ss). Average $(($stopwatch.Elapsed.TotalMinutes/$TotalVMs).ToString('#.##')) minutes per template."
 
 # Disconnect from vCenter(s)
 foreach ($VIServer in $VIServers) {
